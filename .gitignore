@@ -1,0 +1,5 @@
+.streamlit/secrets.toml
+heladeria.db
+heladeria_export.xlsx
+__pycache__/
+*.pyc
