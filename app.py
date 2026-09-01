@@ -54,6 +54,11 @@ def run_query(sql, params=()):
     conn = get_conn()
     df = pd.read_sql_query(sql, conn, params=params)
     conn.close()
+    # Postgres devuelve las columnas DATE como objetos date/Timestamp, no texto.
+    # Las normalizamos a texto "YYYY-MM-DD" para que el resto del código
+    # (comparaciones, .str.startswith, etc.) funcione siempre igual.
+    if "fecha" in df.columns:
+        df["fecha"] = df["fecha"].astype(str)
     return df
 
 
