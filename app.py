@@ -164,6 +164,12 @@ def analizar_imagen_factura(image_bytes, media_type, today):
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
+    es_pdf = media_type == "application/pdf"
+    bloque_documento = (
+        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64}}
+        if es_pdf
+        else {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
+    )
     payload = {
         "model": "claude-sonnet-5",
         "max_tokens": 1024,
@@ -172,7 +178,7 @@ def analizar_imagen_factura(image_bytes, media_type, today):
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                    bloque_documento,
                     {"type": "text", "text": "Extrae los datos de este ticket o factura."},
                 ],
             }
@@ -514,8 +520,8 @@ with tab_subir:
         st.session_state.revision_facturas = []
 
     archivos = st.file_uploader(
-        "Fotos (puedes seleccionar varias a la vez)",
-        type=["jpg", "jpeg", "png", "webp"],
+        "Fotos o PDFs (puedes seleccionar varios a la vez)",
+        type=["jpg", "jpeg", "png", "webp", "pdf"],
         accept_multiple_files=True,
     )
 
