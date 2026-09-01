@@ -133,15 +133,21 @@ def mostrar_adjuntos(tabla, label_col):
 # Lectura de facturas con IA (visión)
 # ----------------------------------------------------------------------------
 
-FACTURA_SYSTEM_PROMPT = """Eres el motor de lectura de tickets y facturas de una heladería en España. \
-Te paso la foto de un ticket, factura o albarán. Léelo y devuelve un array JSON con uno o varios \
-eventos, cada uno con un campo "tipo": "gasto" o "factura".
+FACTURA_SYSTEM_PROMPT = """Eres el motor de lectura de documentos de una heladería en España. \
+Te paso la foto de un ticket, factura, albarán, ticket Z de caja, o una nota manuscrita con \
+el total vendido en un día. Léelo y devuelve un array JSON con uno o varios eventos, cada uno \
+con un campo "tipo": "gasto", "factura" o "venta".
 
 - gasto: {{ "proveedor", "concepto", "categoria" ("Materia prima"|"Suministros"|"Alquiler"|"Nóminas"|"Otros"), "importe" (número), "fecha" (YYYY-MM-DD) }}
 - factura: {{ "tipo_factura" ("Emitida"|"Recibida"), "tercero", "numero" (opcional), "importe" (número), "fecha" (YYYY-MM-DD), "estado" ("Pendiente"|"Pagada") }}
+- venta: {{ "fecha" (YYYY-MM-DD), "importe" (número) }} — usa esto para tickets Z, cierres de caja, \
+resúmenes de TPV, o cualquier nota que indique el total vendido/facturado en un día concreto.
 
 Usa "factura" solo si el documento es claramente una factura formal con número de factura. \
-Para tickets de compra normales, usa "gasto" con el total del ticket. \
+Para tickets de compra normales (algo que la heladería COMPRA a un proveedor), usa "gasto". \
+Para un documento que muestra lo que la heladería VENDIÓ o INGRESÓ en un día, usa "venta". \
+Si la foto trae varios días (por ejemplo una lista de importes con fechas, o una tabla), \
+genera un evento "venta" por cada día distinto. \
 Si no se ve la fecha con claridad, usa {today}. \
 Devuelve SOLO el array JSON, sin texto ni bloques de código markdown alrededor."""
 
@@ -498,9 +504,9 @@ with tab_ventas:
 # SUBIR FACTURA (lectura con IA)
 # ----------------------------------------------------------------------------
 with tab_subir:
-    st.subheader("Subir foto de ticket o factura")
+    st.subheader("Subir foto de ticket, factura o cierre de caja")
     st.caption(
-        "Sube una o varias fotos. Una IA las lee y prepara los gastos/facturas — "
+        "Sube una o varias fotos. Una IA las lee y prepara gastos, facturas o ventas del día — "
         "revisas la vista previa y confirmas antes de que se guarde nada."
     )
 
@@ -542,6 +548,9 @@ with tab_subir:
                 if it.get("tipo") == "factura":
                     titulo = it.get("tercero", "—")
                     detalle = f"Factura {it.get('tipo_factura', '')} · nº {it.get('numero', '—')} · {it.get('estado', '')} · {eur(it.get('importe'))} · {it.get('fecha', '—')}"
+                elif it.get("tipo") == "venta":
+                    titulo = f"Venta del {it.get('fecha', '—')}"
+                    detalle = f"Ingreso del día · {eur(it.get('importe'))}"
                 else:
                     titulo = it.get("proveedor", "—")
                     detalle = f"Gasto · {it.get('concepto', '')} · {it.get('categoria', '')} · {eur(it.get('importe'))} · {it.get('fecha', '—')}"
@@ -567,6 +576,12 @@ with tab_subir:
                             it.get("fecha", date.today().isoformat()),
                             it.get("estado", "Pendiente"),
                         ),
+                    )
+                elif it.get("tipo") == "venta":
+                    execute(
+                        "INSERT INTO ventas (fecha, importe) VALUES (%s,%s) "
+                        "ON CONFLICT (fecha) DO UPDATE SET importe=EXCLUDED.importe",
+                        (it.get("fecha", date.today().isoformat()), it.get("importe", 0)),
                     )
                 else:
                     execute(
