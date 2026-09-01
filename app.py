@@ -220,15 +220,34 @@ with tab_resumen:
 
     stock_bajo = inv[inv["stock"] <= inv["minimo"]] if not inv.empty else inv
 
-    hoy = date.today()
-    mes_actual = hoy.strftime("%Y-%m")
+    # Meses disponibles según los datos que ya hay, para poder mirar cualquiera
+    # (no solo el mes en curso, que casi siempre estará vacío al empezar).
+    meses_con_datos = sorted(set(
+        (list(gastos["fecha"].str[:7]) if not gastos.empty else [])
+        + (list(ventas["fecha"].str[:7]) if not ventas.empty else [])
+    ), reverse=True)
+    mes_actual = date.today().strftime("%Y-%m")
+    opciones_mes = meses_con_datos if meses_con_datos else [mes_actual]
+    if mes_actual not in opciones_mes:
+        opciones_mes = [mes_actual] + opciones_mes
+
+    def nombre_mes(m):
+        y, mm = m.split("-")
+        nombres = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+                   "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        return f"{nombres[int(mm)]} {y}"
+
+    mes_elegido = st.selectbox(
+        "Mes a consultar", opciones_mes, format_func=nombre_mes, key="mes_resumen",
+    )
+
     gasto_mes = 0.0
     if not gastos.empty:
-        gasto_mes = gastos[gastos["fecha"].str.startswith(mes_actual)]["importe"].sum()
+        gasto_mes = gastos[gastos["fecha"].str.startswith(mes_elegido)]["importe"].sum()
 
     ventas_mes = 0.0
     if not ventas.empty:
-        ventas_mes = ventas[ventas["fecha"].str.startswith(mes_actual)]["importe"].sum()
+        ventas_mes = ventas[ventas["fecha"].str.startswith(mes_elegido)]["importe"].sum()
 
     con_coste = precios[(precios["coste"].notna()) & (precios["coste"] > 0)] if not precios.empty else precios
     margen_medio = None
