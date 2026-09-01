@@ -23,10 +23,13 @@ CÓMO TENERLO EN EL MÓVIL:
 """
 
 from datetime import date, timedelta
+import base64
+import json
 
 import pandas as pd
 import psycopg2
 import psycopg2.extras
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Panel Heladería", page_icon="🍦", layout="wide")
@@ -89,14 +92,103 @@ def delete_expander(tabla, df, label_col):
             delete_row(tabla, opciones[elegido])
 
 
+def subir_adjunto_widget(key):
+    """Muestra el selector de archivo y devuelve (bytes, nombre, tipo_mime) o (None, None, None)."""
+    archivo = st.file_uploader(
+        "📎 Adjuntar foto o archivo (opcional)",
+        type=["jpg", "jpeg", "png", "webp", "pdf"],
+        key=key,
+    )
+    if archivo:
+        return archivo.getvalue(), archivo.name, (archivo.type or "application/octet-stream")
+    return None, None, None
+
+
+def mostrar_adjuntos(tabla, label_col):
+    """Expander para ver/descargar los adjuntos guardados en una tabla."""
+    conn = get_conn()
+    dfa = pd.read_sql_query(
+        f"SELECT id, {label_col} AS etiqueta, adjunto, adjunto_nombre, adjunto_tipo "
+        f"FROM {tabla} WHERE adjunto IS NOT NULL ORDER BY id DESC",
+        conn,
+    )
+    conn.close()
+    if dfa.empty:
+        return
+    with st.expander(f"📎 Ver archivos adjuntos ({len(dfa)})"):
+        opciones = {f"{row['etiqueta']} (id {row['id']})": i for i, row in dfa.iterrows()}
+        elegido = st.selectbox("Elige un registro", list(opciones.keys()), key=f"ver_adj_{tabla}")
+        fila = dfa.iloc[opciones[elegido]]
+        contenido = bytes(fila["adjunto"])
+        tipo = fila["adjunto_tipo"] or ""
+        nombre = fila["adjunto_nombre"] or "adjunto"
+        if tipo.startswith("image/"):
+            st.image(contenido, caption=nombre, use_container_width=True)
+        else:
+            st.info(f"Archivo: {nombre} ({tipo})")
+        st.download_button("⬇️ Descargar", contenido, file_name=nombre, key=f"dl_{tabla}_{fila['id']}")
+
+
 # ----------------------------------------------------------------------------
-# Inicializar BD
+# Lectura de facturas con IA (visión)
+# ----------------------------------------------------------------------------
+
+FACTURA_SYSTEM_PROMPT = """Eres el motor de lectura de tickets y facturas de una heladería en España. \
+Te paso la foto de un ticket, factura o albarán. Léelo y devuelve un array JSON con uno o varios \
+eventos, cada uno con un campo "tipo": "gasto" o "factura".
+
+- gasto: {{ "proveedor", "concepto", "categoria" ("Materia prima"|"Suministros"|"Alquiler"|"Nóminas"|"Otros"), "importe" (número), "fecha" (YYYY-MM-DD) }}
+- factura: {{ "tipo_factura" ("Emitida"|"Recibida"), "tercero", "numero" (opcional), "importe" (número), "fecha" (YYYY-MM-DD), "estado" ("Pendiente"|"Pagada") }}
+
+Usa "factura" solo si el documento es claramente una factura formal con número de factura. \
+Para tickets de compra normales, usa "gasto" con el total del ticket. \
+Si no se ve la fecha con claridad, usa {today}. \
+Devuelve SOLO el array JSON, sin texto ni bloques de código markdown alrededor."""
+
+
+def analizar_imagen_factura(image_bytes, media_type, today):
+    if "ANTHROPIC_API_KEY" not in st.secrets:
+        raise RuntimeError(
+            "Falta configurar ANTHROPIC_API_KEY en secrets.toml. "
+            "Consigue una clave gratuita en https://console.anthropic.com/settings/keys"
+        )
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    headers = {
+        "x-api-key": st.secrets["ANTHROPIC_API_KEY"],
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": "claude-sonnet-5",
+        "max_tokens": 1024,
+        "system": FACTURA_SYSTEM_PROMPT.format(today=today),
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                    {"type": "text", "text": "Extrae los datos de este ticket o factura."},
+                ],
+            }
+        ],
+    }
+    r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    texto = "".join(b["text"] for b in data.get("content", []) if b.get("type") == "text")
+    limpio = texto.replace("```json", "").replace("```", "").strip()
+    parsed = json.loads(limpio)
+    if not isinstance(parsed, list):
+        parsed = [parsed]
+    return parsed
+
+
 # ----------------------------------------------------------------------------
 st.title("🍦 Panel de la Heladería")
 st.caption("Conectado a la base de datos en la nube — mismo dato desde el móvil, el PC de la tienda y el portátil")
 
-tab_resumen, tab_inv, tab_gastos, tab_precios, tab_facturas, tab_ventas = st.tabs(
-    ["📊 Resumen", "📦 Inventario", "🧾 Gastos", "💰 Precios y márgenes", "📄 Facturas", "🗓️ Ventas diarias"]
+tab_resumen, tab_inv, tab_gastos, tab_precios, tab_facturas, tab_ventas, tab_subir = st.tabs(
+    ["📊 Resumen", "📦 Inventario", "🧾 Gastos", "💰 Precios y márgenes", "📄 Facturas", "🗓️ Ventas diarias", "📸 Subir factura"]
 )
 
 # ----------------------------------------------------------------------------
@@ -184,6 +276,7 @@ with tab_inv:
         unidad = c3.selectbox("Unidad", ["kg", "L", "ud"])
         minimo = c4.number_input("Mínimo", min_value=0.0, step=1.0)
         coste = st.number_input("Coste unitario (€, opcional)", min_value=0.0, step=0.10)
+        adj_bytes, adj_nombre, adj_tipo = subir_adjunto_widget("adj_inv")
         enviado = st.form_submit_button("Guardar")
         if enviado and nombre.strip():
             existente = run_query("SELECT id FROM inventario WHERE nombre = %s", (nombre.strip(),))
@@ -192,14 +285,24 @@ with tab_inv:
                     "UPDATE inventario SET stock=%s, unidad=%s, minimo=%s, coste=%s WHERE nombre=%s",
                     (stock, unidad, minimo, coste or None, nombre.strip()),
                 )
+                if adj_bytes:
+                    execute(
+                        "UPDATE inventario SET adjunto=%s, adjunto_nombre=%s, adjunto_tipo=%s WHERE nombre=%s",
+                        (psycopg2.Binary(adj_bytes), adj_nombre, adj_tipo, nombre.strip()),
+                    )
             else:
                 execute(
-                    "INSERT INTO inventario (nombre, stock, unidad, minimo, coste) VALUES (%s,%s,%s,%s,%s)",
-                    (nombre.strip(), stock, unidad, minimo, coste or None),
+                    "INSERT INTO inventario (nombre, stock, unidad, minimo, coste, adjunto, adjunto_nombre, adjunto_tipo) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        nombre.strip(), stock, unidad, minimo, coste or None,
+                        psycopg2.Binary(adj_bytes) if adj_bytes else None, adj_nombre, adj_tipo,
+                    ),
                 )
             st.rerun()
 
     delete_expander("inventario", inv, "nombre")
+    mostrar_adjuntos("inventario", "nombre")
 
 # ----------------------------------------------------------------------------
 # GASTOS
@@ -225,15 +328,21 @@ with tab_gastos:
         categoria = c3.selectbox("Categoría", ["Materia prima", "Suministros", "Alquiler", "Nóminas", "Otros"])
         importe = c4.number_input("Importe (€)", min_value=0.0, step=0.50)
         fecha = c5.date_input("Fecha", value=date.today())
+        adj_bytes, adj_nombre, adj_tipo = subir_adjunto_widget("adj_gasto")
         enviado = st.form_submit_button("Guardar")
         if enviado and proveedor.strip() and importe > 0:
             execute(
-                "INSERT INTO gastos (proveedor, concepto, categoria, importe, fecha) VALUES (%s,%s,%s,%s,%s)",
-                (proveedor.strip(), concepto.strip(), categoria, importe, fecha.isoformat()),
+                "INSERT INTO gastos (proveedor, concepto, categoria, importe, fecha, adjunto, adjunto_nombre, adjunto_tipo) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    proveedor.strip(), concepto.strip(), categoria, importe, fecha.isoformat(),
+                    psycopg2.Binary(adj_bytes) if adj_bytes else None, adj_nombre, adj_tipo,
+                ),
             )
             st.rerun()
 
     delete_expander("gastos", gastos, "proveedor")
+    mostrar_adjuntos("gastos", "proveedor")
 
 # ----------------------------------------------------------------------------
 # PRECIOS Y MÁRGENES
@@ -262,16 +371,26 @@ with tab_precios:
         producto = c1.text_input("Producto")
         coste = c2.number_input("Coste (€, opcional)", min_value=0.0, step=0.10)
         precio = c3.number_input("Precio de venta (€)", min_value=0.0, step=0.10)
+        adj_bytes, adj_nombre, adj_tipo = subir_adjunto_widget("adj_precio")
         enviado = st.form_submit_button("Guardar")
         if enviado and producto.strip() and precio > 0:
             existente = run_query("SELECT id FROM precios WHERE producto = %s", (producto.strip(),))
             if not existente.empty:
                 execute("UPDATE precios SET coste=%s, precio=%s WHERE producto=%s", (coste or None, precio, producto.strip()))
+                if adj_bytes:
+                    execute(
+                        "UPDATE precios SET adjunto=%s, adjunto_nombre=%s, adjunto_tipo=%s WHERE producto=%s",
+                        (psycopg2.Binary(adj_bytes), adj_nombre, adj_tipo, producto.strip()),
+                    )
             else:
-                execute("INSERT INTO precios (producto, coste, precio) VALUES (%s,%s,%s)", (producto.strip(), coste or None, precio))
+                execute(
+                    "INSERT INTO precios (producto, coste, precio, adjunto, adjunto_nombre, adjunto_tipo) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (producto.strip(), coste or None, precio, psycopg2.Binary(adj_bytes) if adj_bytes else None, adj_nombre, adj_tipo),
+                )
             st.rerun()
 
     delete_expander("precios", precios, "producto")
+    mostrar_adjuntos("precios", "producto")
 
 # ----------------------------------------------------------------------------
 # FACTURAS
@@ -298,15 +417,21 @@ with tab_facturas:
         importe = c4.number_input("Importe (€)", min_value=0.0, step=0.50)
         fecha = c5.date_input("Fecha", value=date.today())
         estado = c6.selectbox("Estado", ["Pendiente", "Pagada"])
+        adj_bytes, adj_nombre, adj_tipo = subir_adjunto_widget("adj_factura")
         enviado = st.form_submit_button("Guardar")
         if enviado and tercero.strip() and importe > 0:
             execute(
-                "INSERT INTO facturas (tipo, tercero, numero, importe, fecha, estado) VALUES (%s,%s,%s,%s,%s,%s)",
-                (tipo, tercero.strip(), numero.strip(), importe, fecha.isoformat(), estado),
+                "INSERT INTO facturas (tipo, tercero, numero, importe, fecha, estado, adjunto, adjunto_nombre, adjunto_tipo) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    tipo, tercero.strip(), numero.strip(), importe, fecha.isoformat(), estado,
+                    psycopg2.Binary(adj_bytes) if adj_bytes else None, adj_nombre, adj_tipo,
+                ),
             )
             st.rerun()
 
     delete_expander("facturas", facturas, "tercero")
+    mostrar_adjuntos("facturas", "tercero")
 
 # ----------------------------------------------------------------------------
 # VENTAS DIARIAS
@@ -325,12 +450,19 @@ with tab_ventas:
         c1, c2 = st.columns(2)
         fecha_v = c1.date_input("Fecha", value=date.today(), key="fecha_venta_unica")
         importe_v = c2.number_input("Total vendido ese día (€)", min_value=0.0, step=10.0)
+        adj_bytes, adj_nombre, adj_tipo = subir_adjunto_widget("adj_venta")
         enviado = st.form_submit_button("Guardar")
         if enviado and importe_v > 0:
             execute(
-                "INSERT INTO ventas (fecha, importe) VALUES (%s,%s) "
-                "ON CONFLICT (fecha) DO UPDATE SET importe=EXCLUDED.importe",
-                (fecha_v.isoformat(), importe_v),
+                "INSERT INTO ventas (fecha, importe, adjunto, adjunto_nombre, adjunto_tipo) VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT (fecha) DO UPDATE SET importe=EXCLUDED.importe, "
+                "adjunto=COALESCE(EXCLUDED.adjunto, ventas.adjunto), "
+                "adjunto_nombre=COALESCE(EXCLUDED.adjunto_nombre, ventas.adjunto_nombre), "
+                "adjunto_tipo=COALESCE(EXCLUDED.adjunto_tipo, ventas.adjunto_tipo)",
+                (
+                    fecha_v.isoformat(), importe_v,
+                    psycopg2.Binary(adj_bytes) if adj_bytes else None, adj_nombre, adj_tipo,
+                ),
             )
             st.rerun()
 
@@ -360,6 +492,100 @@ with tab_ventas:
             st.rerun()
 
     delete_expander("ventas", ventas, "fecha")
+    mostrar_adjuntos("ventas", "fecha")
+
+# ----------------------------------------------------------------------------
+# SUBIR FACTURA (lectura con IA)
+# ----------------------------------------------------------------------------
+with tab_subir:
+    st.subheader("Subir foto de ticket o factura")
+    st.caption(
+        "Sube una o varias fotos. Una IA las lee y prepara los gastos/facturas — "
+        "revisas la vista previa y confirmas antes de que se guarde nada."
+    )
+
+    if "revision_facturas" not in st.session_state:
+        st.session_state.revision_facturas = []
+
+    archivos = st.file_uploader(
+        "Fotos (puedes seleccionar varias a la vez)",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+    )
+
+    if archivos and st.button("🔍 Analizar fotos", type="primary"):
+        hoy = date.today().isoformat()
+        nuevos = []
+        errores = []
+        barra = st.progress(0.0, text="Leyendo fotos…")
+        for i, archivo in enumerate(archivos):
+            media_type = archivo.type or "image/jpeg"
+            try:
+                items = analizar_imagen_factura(archivo.getvalue(), media_type, hoy)
+                for it in items:
+                    it["_origen"] = archivo.name
+                    it["_keep"] = True
+                    nuevos.append(it)
+            except Exception as e:
+                errores.append(f"{archivo.name}: {e}")
+            barra.progress((i + 1) / len(archivos), text=f"Leyendo fotos… ({i + 1}/{len(archivos)})")
+        barra.empty()
+        st.session_state.revision_facturas = nuevos
+        for err in errores:
+            st.error(f"No se pudo leer {err}")
+
+    if st.session_state.revision_facturas:
+        st.markdown("##### Revisa antes de guardar")
+        for idx, it in enumerate(st.session_state.revision_facturas):
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                if it.get("tipo") == "factura":
+                    titulo = it.get("tercero", "—")
+                    detalle = f"Factura {it.get('tipo_factura', '')} · nº {it.get('numero', '—')} · {it.get('estado', '')} · {eur(it.get('importe'))} · {it.get('fecha', '—')}"
+                else:
+                    titulo = it.get("proveedor", "—")
+                    detalle = f"Gasto · {it.get('concepto', '')} · {it.get('categoria', '')} · {eur(it.get('importe'))} · {it.get('fecha', '—')}"
+                st.markdown(f"**{titulo}** — {it.get('_origen', '')}")
+                st.caption(detalle)
+            with c2:
+                it["_keep"] = st.checkbox("Guardar", value=it.get("_keep", True), key=f"keep_{idx}")
+
+        colb1, colb2 = st.columns(2)
+        if colb1.button("✅ Confirmar y guardar todo", type="primary"):
+            guardados = 0
+            for it in st.session_state.revision_facturas:
+                if not it.get("_keep"):
+                    continue
+                if it.get("tipo") == "factura":
+                    execute(
+                        "INSERT INTO facturas (tipo, tercero, numero, importe, fecha, estado) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (
+                            it.get("tipo_factura", "Recibida"),
+                            it.get("tercero", ""),
+                            it.get("numero", ""),
+                            it.get("importe", 0),
+                            it.get("fecha", date.today().isoformat()),
+                            it.get("estado", "Pendiente"),
+                        ),
+                    )
+                else:
+                    execute(
+                        "INSERT INTO gastos (proveedor, concepto, categoria, importe, fecha) VALUES (%s,%s,%s,%s,%s)",
+                        (
+                            it.get("proveedor", ""),
+                            it.get("concepto", ""),
+                            it.get("categoria", "Otros"),
+                            it.get("importe", 0),
+                            it.get("fecha", date.today().isoformat()),
+                        ),
+                    )
+                guardados += 1
+            st.session_state.revision_facturas = []
+            st.success(f"Guardados {guardados} registros.")
+            st.rerun()
+        if colb2.button("Descartar todo"):
+            st.session_state.revision_facturas = []
+            st.rerun()
 
 # ----------------------------------------------------------------------------
 # EXPORTAR A EXCEL
