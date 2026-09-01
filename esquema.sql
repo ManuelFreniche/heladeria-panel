@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS gastos (
     fecha DATE NOT NULL,
     adjunto BYTEA,
     adjunto_nombre TEXT,
-    adjunto_tipo TEXT
+    adjunto_tipo TEXT,
+    UNIQUE (proveedor, importe, fecha)
 );
 
 CREATE TABLE IF NOT EXISTS precios (
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS facturas (
     estado TEXT NOT NULL DEFAULT 'Pendiente',
     adjunto BYTEA,
     adjunto_nombre TEXT,
-    adjunto_tipo TEXT
+    adjunto_tipo TEXT,
+    UNIQUE (tercero, importe, fecha)
 );
 
 CREATE TABLE IF NOT EXISTS ventas (

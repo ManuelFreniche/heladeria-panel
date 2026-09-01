@@ -66,9 +66,11 @@ def execute(sql, params=()):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(sql, params)
+    filas_afectadas = cur.rowcount
     conn.commit()
     cur.close()
     conn.close()
+    return filas_afectadas
 
 
 # ----------------------------------------------------------------------------
@@ -82,19 +84,20 @@ def eur(n):
         return "—"
 
 
-def delete_row(tabla, row_id):
-    execute(f"DELETE FROM {tabla} WHERE id = %s", (row_id,))
-    st.rerun()
-
-
-def delete_expander(tabla, df, label_col):
+def borrar_multiple(tabla, df, hacer_etiqueta):
+    """Expander con selección múltiple para borrar tantos registros como se quiera de golpe."""
     if df.empty:
         return
-    with st.expander("🗑️ Eliminar un registro"):
-        opciones = {f"{row[label_col]} (id {row['id']})": row["id"] for _, row in df.iterrows()}
-        elegido = st.selectbox("Selecciona qué eliminar", list(opciones.keys()), key=f"del_{tabla}")
-        if st.button("Eliminar", key=f"delbtn_{tabla}"):
-            delete_row(tabla, opciones[elegido])
+    with st.expander(f"🗑️ Eliminar registros ({len(df)} en total)"):
+        opciones = {f"{hacer_etiqueta(row)} (id {row['id']})": row["id"] for _, row in df.iterrows()}
+        elegidos = st.multiselect(
+            "Selecciona uno o varios para eliminar", list(opciones.keys()), key=f"delmulti_{tabla}"
+        )
+        if elegidos and st.button(f"🗑️ Eliminar {len(elegidos)} seleccionado(s)", key=f"delmultibtn_{tabla}"):
+            ids = [opciones[e] for e in elegidos]
+            execute(f"DELETE FROM {tabla} WHERE id = ANY(%s)", (ids,))
+            st.success(f"Eliminados {len(ids)} registros.")
+            st.rerun()
 
 
 def subir_adjunto_widget(key):
@@ -337,7 +340,7 @@ with tab_inv:
                 )
             st.rerun()
 
-    delete_expander("inventario", inv, "nombre")
+    borrar_multiple("inventario", inv, lambda r: f"{r['nombre']} · {r['stock']} {r['unidad']}")
     mostrar_adjuntos("inventario", "nombre")
 
 # ----------------------------------------------------------------------------
@@ -367,17 +370,21 @@ with tab_gastos:
         adj_bytes, adj_nombre, adj_tipo = subir_adjunto_widget("adj_gasto")
         enviado = st.form_submit_button("Guardar")
         if enviado and proveedor.strip() and importe > 0:
-            execute(
+            filas = execute(
                 "INSERT INTO gastos (proveedor, concepto, categoria, importe, fecha, adjunto, adjunto_nombre, adjunto_tipo) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (proveedor, importe, fecha) DO NOTHING",
                 (
                     proveedor.strip(), concepto.strip(), categoria, importe, fecha.isoformat(),
                     psycopg2.Binary(adj_bytes) if adj_bytes else None, adj_nombre, adj_tipo,
                 ),
             )
-            st.rerun()
+            if filas == 0:
+                st.warning("Ya existe un gasto igual (mismo proveedor, importe y fecha) — no se ha duplicado.")
+            else:
+                st.rerun()
 
-    delete_expander("gastos", gastos, "proveedor")
+    borrar_multiple("gastos", gastos, lambda r: f"{r['proveedor']} · {eur(r['importe'])} · {r['fecha']}")
     mostrar_adjuntos("gastos", "proveedor")
 
 # ----------------------------------------------------------------------------
@@ -425,7 +432,7 @@ with tab_precios:
                 )
             st.rerun()
 
-    delete_expander("precios", precios, "producto")
+    borrar_multiple("precios", precios, lambda r: f"{r['producto']} · {eur(r['precio'])}")
     mostrar_adjuntos("precios", "producto")
 
 # ----------------------------------------------------------------------------
@@ -456,17 +463,21 @@ with tab_facturas:
         adj_bytes, adj_nombre, adj_tipo = subir_adjunto_widget("adj_factura")
         enviado = st.form_submit_button("Guardar")
         if enviado and tercero.strip() and importe > 0:
-            execute(
+            filas = execute(
                 "INSERT INTO facturas (tipo, tercero, numero, importe, fecha, estado, adjunto, adjunto_nombre, adjunto_tipo) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (tercero, importe, fecha) DO NOTHING",
                 (
                     tipo, tercero.strip(), numero.strip(), importe, fecha.isoformat(), estado,
                     psycopg2.Binary(adj_bytes) if adj_bytes else None, adj_nombre, adj_tipo,
                 ),
             )
-            st.rerun()
+            if filas == 0:
+                st.warning("Ya existe una factura igual (mismo cliente/proveedor, importe y fecha) — no se ha duplicado.")
+            else:
+                st.rerun()
 
-    delete_expander("facturas", facturas, "tercero")
+    borrar_multiple("facturas", facturas, lambda r: f"{r['tercero']} · {eur(r['importe'])} · {r['fecha']}")
     mostrar_adjuntos("facturas", "tercero")
 
 # ----------------------------------------------------------------------------
@@ -527,7 +538,7 @@ with tab_ventas:
             st.success(f"Guardadas {guardadas} ventas, del {fecha_inicio.isoformat()} en adelante.")
             st.rerun()
 
-    delete_expander("ventas", ventas, "fecha")
+    borrar_multiple("ventas", ventas, lambda r: f"{r['fecha']} · {eur(r['importe'])}")
     mostrar_adjuntos("ventas", "fecha")
 
 # ----------------------------------------------------------------------------
@@ -592,12 +603,14 @@ with tab_subir:
         colb1, colb2 = st.columns(2)
         if colb1.button("✅ Confirmar y guardar todo", type="primary"):
             guardados = 0
+            duplicados = 0
             for it in st.session_state.revision_facturas:
                 if not it.get("_keep"):
                     continue
                 if it.get("tipo") == "factura":
-                    execute(
-                        "INSERT INTO facturas (tipo, tercero, numero, importe, fecha, estado) VALUES (%s,%s,%s,%s,%s,%s)",
+                    filas = execute(
+                        "INSERT INTO facturas (tipo, tercero, numero, importe, fecha, estado) VALUES (%s,%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (tercero, importe, fecha) DO NOTHING",
                         (
                             it.get("tipo_factura", "Recibida"),
                             it.get("tercero", ""),
@@ -608,14 +621,15 @@ with tab_subir:
                         ),
                     )
                 elif it.get("tipo") == "venta":
-                    execute(
+                    filas = execute(
                         "INSERT INTO ventas (fecha, importe) VALUES (%s,%s) "
                         "ON CONFLICT (fecha) DO UPDATE SET importe=EXCLUDED.importe",
                         (it.get("fecha", date.today().isoformat()), it.get("importe", 0)),
                     )
                 else:
-                    execute(
-                        "INSERT INTO gastos (proveedor, concepto, categoria, importe, fecha) VALUES (%s,%s,%s,%s,%s)",
+                    filas = execute(
+                        "INSERT INTO gastos (proveedor, concepto, categoria, importe, fecha) VALUES (%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (proveedor, importe, fecha) DO NOTHING",
                         (
                             it.get("proveedor", ""),
                             it.get("concepto", ""),
@@ -624,9 +638,15 @@ with tab_subir:
                             it.get("fecha", date.today().isoformat()),
                         ),
                     )
-                guardados += 1
+                if filas and filas > 0:
+                    guardados += 1
+                else:
+                    duplicados += 1
             st.session_state.revision_facturas = []
-            st.success(f"Guardados {guardados} registros.")
+            if guardados:
+                st.success(f"Guardados {guardados} registros nuevos.")
+            if duplicados:
+                st.warning(f"{duplicados} ya existían (mismo importe y fecha) y no se han duplicado.")
             st.rerun()
         if colb2.button("Descartar todo"):
             st.session_state.revision_facturas = []
