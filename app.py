@@ -22,7 +22,7 @@ CÓMO TENERLO EN EL MÓVIL:
     navegador de móvil. Ver README.md para el paso a paso.
 """
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import base64
 import json
 
@@ -207,8 +207,8 @@ def analizar_imagen_factura(image_bytes, media_type, today):
 st.title("🍦 Panel de la Heladería")
 st.caption("Conectado a la base de datos en la nube — mismo dato desde el móvil, el PC de la tienda y el portátil")
 
-tab_resumen, tab_inv, tab_gastos, tab_precios, tab_facturas, tab_ventas, tab_subir = st.tabs(
-    ["📊 Resumen", "📦 Inventario", "🧾 Gastos", "💰 Precios y márgenes", "📄 Facturas", "🗓️ Ventas diarias", "📸 Subir factura"]
+tab_resumen, tab_inv, tab_gastos, tab_precios, tab_facturas, tab_ventas, tab_subir, tab_robot = st.tabs(
+    ["📊 Resumen", "📦 Inventario", "🧾 Gastos", "💰 Precios y márgenes", "📄 Facturas", "🗓️ Ventas diarias", "📸 Subir factura", "🤖 Revisión del robot"]
 )
 
 # ----------------------------------------------------------------------------
@@ -651,6 +651,73 @@ with tab_subir:
         if colb2.button("Descartar todo"):
             st.session_state.revision_facturas = []
             st.rerun()
+
+# ----------------------------------------------------------------------------
+# REVISIÓN DEL ROBOT DE CORREO
+# ----------------------------------------------------------------------------
+with tab_robot:
+    st.subheader("Detecciones del robot de correo")
+    st.caption(
+        "El robot lee tu correo y deja aquí lo que detecta en cada PDF. Nunca guarda nada "
+        "solo en Gastos — revisa cada uno, corrige si hace falta, y aprueba o descarta."
+    )
+
+    pendientes = run_query(
+        "SELECT * FROM gastos_pendientes WHERE estado = 'Pendiente' ORDER BY detectado_en DESC"
+    )
+
+    if pendientes.empty:
+        st.info("No hay detecciones pendientes de revisar ahora mismo.")
+    else:
+        st.caption(f"{len(pendientes)} pendientes de revisar")
+        for _, fila in pendientes.iterrows():
+            with st.container(border=True):
+                c1, c2 = st.columns([3, 2])
+                with c1:
+                    st.markdown(f"📎 **{fila['archivo_nombre'] or 'archivo'}**")
+                    st.caption(f"De: {fila['origen_remitente'] or '—'}")
+                    st.caption(f"Asunto: {fila['origen_asunto'] or '—'}")
+                    if fila["adjunto"] is not None:
+                        st.download_button(
+                            "⬇️ Ver PDF original", bytes(fila["adjunto"]),
+                            file_name=fila["archivo_nombre"] or "factura.pdf",
+                            key=f"ver_pdf_{fila['id']}",
+                        )
+                with c2:
+                    proveedor_ed = st.text_input("Proveedor", value=fila["proveedor"] or "", key=f"prov_{fila['id']}")
+                    categoria_ed = st.selectbox(
+                        "Categoría", ["Materia prima", "Suministros", "Alquiler", "Nóminas", "Otros"],
+                        index=["Materia prima", "Suministros", "Alquiler", "Nóminas", "Otros"].index(fila["categoria"])
+                        if fila["categoria"] in ["Materia prima", "Suministros", "Alquiler", "Nóminas", "Otros"] else 0,
+                        key=f"cat_{fila['id']}",
+                    )
+                    importe_ed = st.number_input(
+                        "Importe (€)", min_value=0.0, step=0.10,
+                        value=float(fila["importe"]) if fila["importe"] else 0.0, key=f"imp_{fila['id']}",
+                    )
+                    fecha_valor = fila["fecha"]
+                    fecha_ed = st.date_input(
+                        "Fecha",
+                        value=datetime.strptime(fecha_valor, "%Y-%m-%d").date()
+                        if fecha_valor and fecha_valor != "None" else date.today(),
+                        key=f"fecha_{fila['id']}",
+                    )
+
+                colb1, colb2 = st.columns(2)
+                if colb1.button("✅ Aprobar y guardar en Gastos", key=f"aprobar_{fila['id']}", type="primary"):
+                    execute(
+                        "INSERT INTO gastos (proveedor, concepto, categoria, importe, fecha, adjunto, adjunto_tipo) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (proveedor, importe, fecha) DO NOTHING",
+                        (
+                            proveedor_ed.strip(), fila["concepto"], categoria_ed, importe_ed, fecha_ed.isoformat(),
+                            fila["adjunto"], fila["adjunto_tipo"],
+                        ),
+                    )
+                    execute("UPDATE gastos_pendientes SET estado='Aprobado' WHERE id=%s", (fila["id"],))
+                    st.rerun()
+                if colb2.button("❌ Descartar", key=f"descartar_{fila['id']}"):
+                    execute("UPDATE gastos_pendientes SET estado='Rechazado' WHERE id=%s", (fila["id"],))
+                    st.rerun()
 
 # ----------------------------------------------------------------------------
 # EXPORTAR A EXCEL

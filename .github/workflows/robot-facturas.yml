@@ -1,0 +1,32 @@
+name: Robot de facturas por correo
+
+on:
+  schedule:
+    # Todos los días a las 06:00 UTC (~08:00 hora de España en verano)
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}  # también se puede lanzar a mano desde la pestaña "Actions" de GitHub
+
+jobs:
+  revisar-correo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar OCR (Tesseract) y utilidades de PDF
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-spa poppler-utils
+
+      - name: Instalar dependencias de Python
+        run: pip install psycopg2-binary pytesseract pdf2image
+
+      - name: Ejecutar el robot
+        env:
+          IMAP_EMAIL: ${{ secrets.IMAP_EMAIL }}
+          IMAP_APP_PASSWORD: ${{ secrets.IMAP_APP_PASSWORD }}
+          DB_URL: ${{ secrets.DB_URL }}
+        run: python3 robot/imap_fetch.py
