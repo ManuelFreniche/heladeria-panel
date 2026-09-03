@@ -143,29 +143,32 @@ def detectar_fecha(texto):
 
 
 def analizar_pdf(ruta_pdf):
-    """Devuelve una lista de eventos gasto detectados en el PDF (uno por página con datos)."""
-    return _eventos_desde_textos(ocr_pdf(ruta_pdf))
+    """Devuelve una lista de eventos gasto completos detectados en el PDF (uno por página con datos)."""
+    return [d for d in detectar_por_pagina(ocr_pdf(ruta_pdf)) if _completo(d)]
 
 
 def analizar_pdf_bytes(pdf_bytes):
     """Igual que analizar_pdf, pero a partir de los bytes de un adjunto de correo."""
-    return _eventos_desde_textos(ocr_pdf_bytes(pdf_bytes))
+    return [d for d in detectar_por_pagina(ocr_pdf_bytes(pdf_bytes)) if _completo(d)]
 
 
-def _eventos_desde_textos(textos):
-    eventos = []
+def _completo(d):
+    return bool(d["proveedor"] and d["importe"] and d["fecha"])
+
+
+def detectar_por_pagina(textos):
+    """Analiza cada página POR SEPARADO (nunca mezcla texto de páginas distintas,
+    para no combinar por error datos de dos facturas diferentes en un mismo PDF)."""
+    resultados = []
     for texto in textos:
         proveedor, categoria = detectar_proveedor(texto)
-        total = detectar_total(texto)
-        fecha = detectar_fecha(texto)
-        if proveedor and total and fecha:
-            eventos.append({
-                "proveedor": proveedor,
-                "categoria": categoria,
-                "importe": total,
-                "fecha": fecha,
-            })
-    return eventos
+        resultados.append({
+            "proveedor": proveedor,
+            "categoria": categoria,
+            "importe": detectar_total(texto),
+            "fecha": detectar_fecha(texto),
+        })
+    return resultados
 
 
 if __name__ == "__main__":

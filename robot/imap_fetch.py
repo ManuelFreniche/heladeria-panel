@@ -25,7 +25,7 @@ import psycopg2
 import psycopg2.extras
 
 sys.path.insert(0, os.path.dirname(__file__))
-from lector_facturas import analizar_pdf_bytes  # noqa: E402
+from lector_facturas import ocr_pdf_bytes, detectar_por_pagina, _completo  # noqa: E402
 
 IMAP_SERVIDOR = "imap.gmail.com"
 CARPETA = "INBOX"
@@ -87,11 +87,11 @@ def guardar_pendiente(conn, evento, asunto, remitente, nombre_archivo, pdf_bytes
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
         (
-            evento["proveedor"],
+            evento.get("proveedor"),
             f"Detectado automáticamente del correo: {asunto}",
-            evento["categoria"],
-            evento["importe"],
-            evento["fecha"],
+            evento.get("categoria", "Otros"),
+            evento.get("importe"),
+            evento.get("fecha"),
             asunto,
             remitente,
             nombre_archivo,
@@ -117,30 +117,43 @@ def main():
     print(f"Correos sin leer encontrados: {len(nums)}")
 
     total_detectados = 0
+    total_parciales = 0
     for num in nums:
         typ, datos_msg = imap.fetch(num, "(RFC822)")
         msg = email.message_from_bytes(datos_msg[0][1])
         asunto = decodificar(msg.get("Subject"))
         remitente = decodificar(msg.get("From"))
+        print(f"\nCorreo: '{asunto}' (de {remitente})")
 
         adjuntos = extraer_adjuntos_pdf(msg)
         if not adjuntos:
+            print("  Sin PDF adjunto — se deja como no leído, no se toca.")
             continue
+
+        print(f"  {len(adjuntos)} PDF adjunto(s): {[n for n, _ in adjuntos]}")
 
         for nombre_archivo, pdf_bytes in adjuntos:
             try:
-                eventos = analizar_pdf_bytes(pdf_bytes)
+                textos = ocr_pdf_bytes(pdf_bytes)
+                detecciones = detectar_por_pagina(textos)
             except Exception as e:
-                print(f"  ! No se pudo leer {nombre_archivo}: {e}")
-                continue
-            for ev in eventos:
-                guardar_pendiente(conn, ev, asunto, remitente, nombre_archivo, pdf_bytes)
-                total_detectados += 1
-                print(f"  + {ev['proveedor']} · {ev['importe']}€ · {ev['fecha']} (de {nombre_archivo})")
+                print(f"  ! No se pudo procesar {nombre_archivo}: {e}")
+                detecciones = []
+
+            for d in detecciones:
+                guardar_pendiente(conn, d, asunto, remitente, nombre_archivo, pdf_bytes)
+                if _completo(d):
+                    total_detectados += 1
+                    print(f"  + Detectado: {d['proveedor']} · {d['importe']}€ · {d['fecha']}")
+                else:
+                    total_parciales += 1
+                    print(f"  ~ Lectura incompleta (proveedor={d['proveedor']}, total={d['importe']}, "
+                          f"fecha={d['fecha']}) — guardado en blanco para completar a mano")
 
         marcar_procesado(imap, num)
 
-    print(f"\nTotal detecciones guardadas en gastos_pendientes: {total_detectados}")
+    print(f"\nDetecciones completas: {total_detectados}")
+    print(f"Pendientes en blanco (a completar a mano): {total_parciales}")
     imap.logout()
     conn.close()
 
