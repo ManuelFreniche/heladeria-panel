@@ -104,11 +104,16 @@ def detectar_total(texto):
             if val:
                 return val
     # Red de seguridad 1: número junto a "total" aunque no lleve el símbolo €
+    # (evitando confundirlo con "base imponible", que no es el total real)
     for m in re.finditer(r"total[^\d\n]{0,15}([\d]{1,3}(?:[.,]\d{3})*[.,]\d{2})", texto_low):
+        contexto = texto_low[max(0, m.start() - 25):m.end()]
+        if "imponible" in contexto or "base" in contexto:
+            continue
         val = limpiar_importe(m.group(1))
         if val:
             return val
     # Red de seguridad 2: coger el número con € más grande de la página
+    # (la base imponible casi nunca lleva el símbolo € en estos formatos)
     candidatos = re.findall(r"([\d]{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*€", texto)
     valores = [limpiar_importe(c) for c in candidatos]
     valores = [v for v in valores if v]

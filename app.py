@@ -29,6 +29,7 @@ import json
 import pandas as pd
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 import requests
 import streamlit as st
 
@@ -38,7 +39,13 @@ st.set_page_config(page_title="Panel Heladería", page_icon="🍦", layout="wide
 # Base de datos (Postgres en la nube — Supabase)
 # ----------------------------------------------------------------------------
 
-def get_conn():
+# Base de datos (Postgres en la nube — Supabase)
+# ----------------------------------------------------------------------------
+
+@st.cache_resource
+def get_pool():
+    """Un pool de conexiones reutilizables, creado una sola vez por sesión de la
+    app (no una conexión nueva en cada clic — eso era gran parte de la lentitud)."""
     if "DB_URL" not in st.secrets:
         st.error(
             "Falta configurar la conexión a la base de datos.\n\n"
@@ -47,13 +54,21 @@ def get_conn():
             "Consulta README.md para el paso a paso."
         )
         st.stop()
-    return psycopg2.connect(st.secrets["DB_URL"])
+    return psycopg2.pool.ThreadedConnectionPool(1, 8, st.secrets["DB_URL"])
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def run_query(sql, params=()):
-    conn = get_conn()
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
+    """Lecturas cacheadas 20s: si dos pestañas piden lo mismo en ese rato, no
+    se repite el viaje a Supabase. Se invalida sola en cuanto se guarda algo
+    (ver execute más abajo), así nunca se ve un dato desactualizado tras
+    guardar."""
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        df = pd.read_sql_query(sql, conn, params=params)
+    finally:
+        pool.putconn(conn)
     # Postgres devuelve las columnas DATE como objetos date/Timestamp, no texto.
     # Las normalizamos a texto "YYYY-MM-DD" para que el resto del código
     # (comparaciones, .str.startswith, etc.) funcione siempre igual.
@@ -63,13 +78,17 @@ def run_query(sql, params=()):
 
 
 def execute(sql, params=()):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    filas_afectadas = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        filas_afectadas = cur.rowcount
+        conn.commit()
+        cur.close()
+    finally:
+        pool.putconn(conn)
+    run_query.clear()  # cualquier guardado invalida la caché de lecturas
     return filas_afectadas
 
 
@@ -91,6 +110,40 @@ def parsear_fecha_segura(valor, por_defecto=None):
         return datetime.strptime(str(valor), "%Y-%m-%d").date()
     except (TypeError, ValueError):
         return por_defecto if por_defecto is not None else date.today()
+
+
+def nombre_mes(m):
+    y, mm = m.split("-")
+    nombres = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+               "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    return f"{nombres[int(mm)]} {y}"
+
+
+def selector_mes(df, key, con_todos=True):
+    """Desplegable de mes a partir de las fechas presentes en df. Se abre por
+    defecto en el mes actual (o el más reciente con datos si el actual está
+    vacío). Devuelve 'YYYY-MM', o None si se elige 'Todos los meses'."""
+    meses_con_datos = sorted(
+        set(df["fecha"].str[:7]) if not df.empty else set(), reverse=True
+    )
+    mes_actual = date.today().strftime("%Y-%m")
+    opciones = meses_con_datos if meses_con_datos else [mes_actual]
+    if mes_actual not in opciones:
+        opciones = [mes_actual] + opciones
+    etiquetas = {m: nombre_mes(m) for m in opciones}
+    if con_todos:
+        opciones = ["__todos__"] + opciones
+        etiquetas["__todos__"] = "Todos los meses"
+    elegido = st.selectbox(
+        "Mes a consultar", opciones, format_func=lambda m: etiquetas[m], key=key,
+    )
+    return None if elegido == "__todos__" else elegido
+
+
+def filtrar_por_mes(df, mes):
+    if mes is None or df.empty:
+        return df
+    return df[df["fecha"].str.startswith(mes)]
 
 
 def borrar_multiple(tabla, df, hacer_etiqueta):
@@ -123,13 +176,10 @@ def subir_adjunto_widget(key):
 
 def mostrar_adjuntos(tabla, label_col):
     """Expander para ver/descargar los adjuntos guardados en una tabla."""
-    conn = get_conn()
-    dfa = pd.read_sql_query(
+    dfa = run_query(
         f"SELECT id, {label_col} AS etiqueta, adjunto, adjunto_nombre, adjunto_tipo "
-        f"FROM {tabla} WHERE adjunto IS NOT NULL ORDER BY id DESC",
-        conn,
+        f"FROM {tabla} WHERE adjunto IS NOT NULL ORDER BY id DESC"
     )
-    conn.close()
     if dfa.empty:
         return
     with st.expander(f"📎 Ver archivos adjuntos ({len(dfa)})"):
@@ -232,26 +282,10 @@ with tab_resumen:
 
     stock_bajo = inv[inv["stock"] <= inv["minimo"]] if not inv.empty else inv
 
-    # Meses disponibles según los datos que ya hay, para poder mirar cualquiera
+    # Meses disponibles según gastos y ventas juntos, para poder mirar cualquiera
     # (no solo el mes en curso, que casi siempre estará vacío al empezar).
-    meses_con_datos = sorted(set(
-        (list(gastos["fecha"].str[:7]) if not gastos.empty else [])
-        + (list(ventas["fecha"].str[:7]) if not ventas.empty else [])
-    ), reverse=True)
-    mes_actual = date.today().strftime("%Y-%m")
-    opciones_mes = meses_con_datos if meses_con_datos else [mes_actual]
-    if mes_actual not in opciones_mes:
-        opciones_mes = [mes_actual] + opciones_mes
-
-    def nombre_mes(m):
-        y, mm = m.split("-")
-        nombres = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
-                   "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-        return f"{nombres[int(mm)]} {y}"
-
-    mes_elegido = st.selectbox(
-        "Mes a consultar", opciones_mes, format_func=nombre_mes, key="mes_resumen",
-    )
+    df_para_meses = pd.concat([gastos[["fecha"]], ventas[["fecha"]]]) if not gastos.empty or not ventas.empty else gastos
+    mes_elegido = selector_mes(df_para_meses, key="mes_resumen", con_todos=False)
 
     gasto_mes = 0.0
     if not gastos.empty:
@@ -359,13 +393,18 @@ with tab_gastos:
     st.subheader("Proveedores y gastos")
     gastos = run_query("SELECT * FROM gastos ORDER BY fecha DESC")
 
-    if not gastos.empty:
+    mes_gastos = selector_mes(gastos, key="mes_gastos")
+    gastos_vista = filtrar_por_mes(gastos, mes_gastos)
+
+    if not gastos_vista.empty:
+        st.caption(f"Total {nombre_mes(mes_gastos) if mes_gastos else 'de todos los meses'}: "
+                   f"{eur(gastos_vista['importe'].sum())} ({len(gastos_vista)} gastos)")
         st.dataframe(
-            gastos[["fecha", "proveedor", "concepto", "categoria", "importe"]],
+            gastos_vista[["fecha", "proveedor", "concepto", "categoria", "importe"]],
             hide_index=True, use_container_width=True,
         )
     else:
-        st.info("Aún no hay gastos registrados.")
+        st.info("No hay gastos en este mes." if mes_gastos else "Aún no hay gastos registrados.")
 
     st.markdown("##### Añadir gasto")
     with st.form("form_gasto", clear_on_submit=True):
@@ -451,13 +490,18 @@ with tab_facturas:
     st.subheader("Facturas")
     facturas = run_query("SELECT * FROM facturas ORDER BY fecha DESC")
 
-    if not facturas.empty:
+    mes_facturas = selector_mes(facturas, key="mes_facturas")
+    facturas_vista = filtrar_por_mes(facturas, mes_facturas)
+
+    if not facturas_vista.empty:
+        st.caption(f"Total {nombre_mes(mes_facturas) if mes_facturas else 'de todos los meses'}: "
+                   f"{eur(facturas_vista['importe'].sum())} ({len(facturas_vista)} facturas)")
         st.dataframe(
-            facturas[["fecha", "tipo", "tercero", "numero", "importe", "estado"]],
+            facturas_vista[["fecha", "tipo", "tercero", "numero", "importe", "estado"]],
             hide_index=True, use_container_width=True,
         )
     else:
-        st.info("Aún no hay facturas registradas.")
+        st.info("No hay facturas en este mes." if mes_facturas else "Aún no hay facturas registradas.")
 
     st.markdown("##### Añadir factura")
     with st.form("form_factura", clear_on_submit=True):
@@ -496,10 +540,15 @@ with tab_ventas:
     st.subheader("Ventas diarias")
     ventas = run_query("SELECT * FROM ventas ORDER BY fecha DESC")
 
-    if not ventas.empty:
-        st.dataframe(ventas[["fecha", "importe"]], hide_index=True, use_container_width=True)
+    mes_ventas = selector_mes(ventas, key="mes_ventas")
+    ventas_vista = filtrar_por_mes(ventas, mes_ventas)
+
+    if not ventas_vista.empty:
+        st.caption(f"Total {nombre_mes(mes_ventas) if mes_ventas else 'de todos los meses'}: "
+                   f"{eur(ventas_vista['importe'].sum())} ({len(ventas_vista)} días)")
+        st.dataframe(ventas_vista[["fecha", "importe"]], hide_index=True, use_container_width=True)
     else:
-        st.info("Aún no hay ventas registradas.")
+        st.info("No hay ventas en este mes." if mes_ventas else "Aún no hay ventas registradas.")
 
     st.markdown("##### Añadir una venta")
     with st.form("form_venta", clear_on_submit=True):
@@ -733,11 +782,14 @@ with tab_robot:
 st.divider()
 st.subheader("📥 Exportar todo a Excel")
 if st.button("Generar Excel"):
-    conn = get_conn()
-    with pd.ExcelWriter("heladeria_export.xlsx", engine="openpyxl") as writer:
-        for tabla in ["inventario", "gastos", "precios", "facturas", "ventas"]:
-            df = pd.read_sql_query(f"SELECT * FROM {tabla}", conn)
-            df.to_excel(writer, sheet_name=tabla, index=False)
-    conn.close()
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with pd.ExcelWriter("heladeria_export.xlsx", engine="openpyxl") as writer:
+            for tabla in ["inventario", "gastos", "precios", "facturas", "ventas"]:
+                df = pd.read_sql_query(f"SELECT * FROM {tabla}", conn)
+                df.to_excel(writer, sheet_name=tabla, index=False)
+    finally:
+        pool.putconn(conn)
     with open("heladeria_export.xlsx", "rb") as f:
         st.download_button("Descargar heladeria_export.xlsx", f, file_name="heladeria_export.xlsx")
