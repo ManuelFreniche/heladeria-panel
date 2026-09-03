@@ -84,6 +84,15 @@ def eur(n):
         return "—"
 
 
+def parsear_fecha_segura(valor, por_defecto=None):
+    """Intenta convertir un valor de fecha (string 'YYYY-MM-DD', None, 'NaT', 'nan', etc.)
+    en un date de Python. Si no se puede, devuelve por_defecto (hoy si no se indica otro)."""
+    try:
+        return datetime.strptime(str(valor), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return por_defecto if por_defecto is not None else date.today()
+
+
 def borrar_multiple(tabla, df, hacer_etiqueta):
     """Expander con selección múltiple para borrar tantos registros como se quiera de golpe."""
     if df.empty:
@@ -693,13 +702,12 @@ with tab_robot:
                     )
                     importe_ed = st.number_input(
                         "Importe (€)", min_value=0.0, step=0.10,
-                        value=float(fila["importe"]) if fila["importe"] else 0.0, key=f"imp_{fila['id']}",
+                        value=float(fila["importe"]) if pd.notna(fila["importe"]) else 0.0,
+                        key=f"imp_{fila['id']}",
                     )
-                    fecha_valor = fila["fecha"]
                     fecha_ed = st.date_input(
                         "Fecha",
-                        value=datetime.strptime(fecha_valor, "%Y-%m-%d").date()
-                        if fecha_valor and fecha_valor != "None" else date.today(),
+                        value=parsear_fecha_segura(fila["fecha"]),
                         key=f"fecha_{fila['id']}",
                     )
 
